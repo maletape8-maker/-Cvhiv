@@ -1,0 +1,236 @@
+name: Build NewTouch dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Ecrire le code NewTouch.mm
+        run: |
+          cat > NewTouch.mm << 'EOF'
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+
+          #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+          static BOOL    gEnabled = YES;
+          static CGFloat gSeuil   = 40.0;
+          static const NSTimeInterval kDelaiReset = 0.02;
+          static const CGFloat kZoneBas = 0.08;
+          static const NSTimeInterval kDureeAppuiLong = 0.8;
+
+          static void chargerReglages(void) {
+              NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+              if ([d objectForKey:@"NT_enabled"]) gEnabled = [d boolForKey:@"NT_enabled"];
+              if ([d objectForKey:@"NT_seuil"])   gSeuil   = [d floatForKey:@"NT_seuil"];
+          }
+          static void sauverReglages(void) {
+              NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+              [d setBool:gEnabled forKey:@"NT_enabled"];
+              [d setFloat:gSeuil forKey:@"NT_seuil"];
+          }
+
+          typedef void (*TouchIMP)(id, SEL, NSSet<UITouch *> *, UIEvent *);
+          static TouchIMP origBegan, origMoved, origEnded, origCancelled;
+          static NSMapTable<UITouch *, NSValue *> *refs;
+
+          static void hookTouches(Class cls, SEL sel, TouchIMP *orig, IMP replacement) {
+              Method m = class_getInstanceMethod(cls, sel);
+              if (!m) return;
+              *orig = (TouchIMP)method_getImplementation(m);
+              class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(m));
+          }
+
+          static void newBegan(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
+              for (UITouch *t in touches)
+                  [refs setObject:[NSValue valueWithCGPoint:[t locationInView:nil]] forKey:t];
+              origBegan(self, _cmd, touches, event);
+          }
+
+          static void newMoved(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
+              origMoved(self, _cmd, touches, event);
+              if (!gEnabled) return;
+
+              NSMutableSet<UITouch *> *aReset = nil;
+              for (UITouch *t in touches) {
+                  NSValue *v = [refs objectForKey:t];
+                  if (!v) continue;
+                  CGPoint ref = v.CGPointValue, now = [t locationInView:nil];
+                  if (MAX(fabs(now.x - ref.x), fabs(now.y - ref.y)) >= gSeuil) {
+                      if (!aReset) aReset = [NSMutableSet set];
+                      [aReset addObject:t];
+                      [refs setObject:[NSValue valueWithCGPoint:now] forKey:t];
+                  }
+              }
+              if (!aReset) return;
+
+              __weak id weakSelf = self;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDelaiReset * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{
+                  id s = weakSelf;
+                  if (!s) return;
+                  origEnded(s, @selector(touchesEnded:withEvent:), aReset, event);
+                  origBegan(s, @selector(touchesBegan:withEvent:), aReset, event);
+              });
+          }
+
+          static void newEnded(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
+              for (UITouch *t in touches) [refs removeObjectForKey:t];
+              origEnded(self, _cmd, touches, event);
+          }
+          static void newCancelled(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
+              for (UITouch *t in touches) [refs removeObjectForKey:t];
+              origCancelled(self, _cmd, touches, event);
+          }
+
+          static UIWindow *fenetrePrincipale(void) {
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                      if (![s isKindOfClass:UIWindowScene.class]) continue;
+                      for (UIWindow *w in ((UIWindowScene *)s).windows)
+                          if (w.isKeyWindow) return w;
+                  }
+              }
+              return UIApplication.sharedApplication.keyWindow;
+          }
+
+          @interface NTMenu : NSObject <UIGestureRecognizerDelegate>
+          @property (nonatomic, strong) UIView *panneau;
+          @property (nonatomic, strong) UILabel *labelSeuil;
+          @property (nonatomic, weak)   UIWindow *fenetre;
+          + (instancetype)shared;
+          - (void)installerSiBesoin;
+          @end
+
+          @implementation NTMenu
+
+          + (instancetype)shared {
+              static NTMenu *m; static dispatch_once_t once;
+              dispatch_once(&once, ^{ m = [NTMenu new]; });
+              return m;
+          }
+
+          - (void)installerSiBesoin {
+              if (self.fenetre) return;
+              UIWindow *w = fenetrePrincipale();
+              if (!w) return;
+              self.fenetre = w;
+
+              UILongPressGestureRecognizer *lp =
+                  [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(appuiLong:)];
+              lp.minimumPressDuration = kDureeAppuiLong;
+              lp.allowableMovement = 12;
+              lp.cancelsTouchesInView = NO;
+              lp.delaysTouchesBegan = NO;
+              lp.delaysTouchesEnded = NO;
+              lp.delegate = self;
+              [w addGestureRecognizer:lp];
+          }
+
+          - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+              UIWindow *w = self.fenetre;
+              if (!w) return NO;
+              CGPoint p = [t locationInView:w];
+              return p.y > w.bounds.size.height * (1.0 - kZoneBas);
+          }
+          - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+              shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o { return YES; }
+
+          - (void)appuiLong:(UILongPressGestureRecognizer *)g {
+              if (g.state != UIGestureRecognizerStateBegan) return;
+              if (self.panneau) [self fermer]; else [self ouvrir];
+          }
+
+          - (UILabel *)label:(NSString *)txt frame:(CGRect)f {
+              UILabel *l = [[UILabel alloc] initWithFrame:f];
+              l.text = txt; l.textColor = UIColor.whiteColor;
+              l.font = [UIFont systemFontOfSize:15];
+              return l;
+          }
+
+          - (void)ouvrir {
+              UIWindow *w = self.fenetre;
+              if (!w) return;
+              UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 280, 210)];
+              p.center = CGPointMake(w.bounds.size.width / 2, w.bounds.size.height / 2);
+              p.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
+              p.layer.cornerRadius = 16;
+
+              UILabel *titre = [self label:@"New Touch - Reglages" frame:CGRectMake(16, 12, 248, 24)];
+              titre.font = [UIFont boldSystemFontOfSize:17];
+              [p addSubview:titre];
+
+              [p addSubview:[self label:@"Activer New Touch" frame:CGRectMake(16, 52, 170, 31)]];
+              UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(215, 52, 51, 31)];
+              sw.on = gEnabled;
+              [sw addTarget:self action:@selector(switchChange:) forControlEvents:UIControlEventValueChanged];
+              [p addSubview:sw];
+
+              self.labelSeuil = [self label:[NSString stringWithFormat:@"Seuil : %.0f", gSeuil]
+                                      frame:CGRectMake(16, 98, 248, 20)];
+              [p addSubview:self.labelSeuil];
+              UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, 122, 248, 30)];
+              sl.minimumValue = 20; sl.maximumValue = 120; sl.value = gSeuil;
+              [sl addTarget:self action:@selector(sliderChange:) forControlEvents:UIControlEventValueChanged];
+              [p addSubview:sl];
+
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+              b.frame = CGRectMake(90, 164, 100, 34);
+              [b setTitle:@"Fermer" forState:UIControlStateNormal];
+              [b addTarget:self action:@selector(fermer) forControlEvents:UIControlEventTouchUpInside];
+              [p addSubview:b];
+
+              [w addSubview:p];
+              self.panneau = p;
+          }
+
+          - (void)fermer {
+              [self.panneau removeFromSuperview];
+              self.panneau = nil;
+              sauverReglages();
+          }
+          - (void)switchChange:(UISwitch *)s { gEnabled = s.on; sauverReglages(); }
+          - (void)sliderChange:(UISlider *)s {
+              gSeuil = round(s.value);
+              self.labelSeuil.text = [NSString stringWithFormat:@"Seuil : %.0f", gSeuil];
+          }
+          @end
+
+          __attribute__((constructor))
+          static void NewTouchInit(void) {
+              chargerReglages();
+              refs = [NSMapTable weakToStrongObjectsMapTable];
+
+              Class unityView = NSClassFromString(@"UnityView");
+              if (unityView) {
+                  hookTouches(unityView, @selector(touchesBegan:withEvent:),     &origBegan,     (IMP)newBegan);
+                  hookTouches(unityView, @selector(touchesMoved:withEvent:),     &origMoved,     (IMP)newMoved);
+                  hookTouches(unityView, @selector(touchesEnded:withEvent:),     &origEnded,     (IMP)newEnded);
+                  hookTouches(unityView, @selector(touchesCancelled:withEvent:), &origCancelled, (IMP)newCancelled);
+              }
+
+              [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                              object:nil queue:NSOperationQueue.mainQueue
+                                                          usingBlock:^(NSNotification *n) {
+                  [[NTMenu shared] installerSiBesoin];
+              }];
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                  [[NTMenu shared] installerSiBesoin];
+              });
+          }
+          EOF
+
+      - name: Compiler le dylib
+        run: |
+          xcrun -sdk iphoneos clang++ -arch arm64 -dynamiclib -fobjc-arc \
+            -framework UIKit -framework Foundation \
+            -miphoneos-version-min=12.0 \
+            NewTouch.mm -o NewTouch.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NewTouch-dylib
+          path: NewTouch.dylib
